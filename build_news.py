@@ -37,16 +37,20 @@ NEWS_OUT = OUT_DIR / 'news.json'
 ASSETS_CACHE = Path(__file__).parent / '.assets_cache.json'
 SCORE_CACHE = Path(__file__).parent / '.score_cache.json'  # persistent LLM scores
 FETCH_TIMEOUT = 20
+FETCH_RETRIES = 2              # retry failed feeds N times (#6)
 MAX_NEWS_OUTPUT = 300          # cap items in news.json
 ASSETS_REFRESH_SEC = 86400     # refresh top-100 once a day
 NEWS_MAX_AGE_HOURS = 72        # drop news older than this
 
 # --- Claude / scoring config ---
 CLAUDE_MODEL = 'claude-haiku-4-5-20251001'
-CLAUDE_MAX_TOKENS = 500        # ceiling for the JSON response
-CLAUDE_MAX_PER_RUN = 25        # safety cap: don't score more than N new items per run
+CLAUDE_MAX_TOKENS = 600        # ceiling for the JSON response
+CLAUDE_MAX_PER_RUN = 30        # safety cap: don't score more than N new items per run
 IMPACT_THRESHOLD = 3.0         # items below this are "dust" -> excluded from news.json
 SCORE_CACHE_MAX_AGE = 72 * 3600  # forget cached scores older than this
+
+# Source weighting (#17): low-quality / SEO-heavy feeds get penalized in candidate ranking
+LOW_QUALITY_SOURCES = {'99Bitcoins', 'CoinCodex', 'Bitcoinist'}
 
 USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
               'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
@@ -102,15 +106,39 @@ AMBIGUOUS_SYMBOLS = {
 }
 
 
-def fetch_url(url: str, timeout=FETCH_TIMEOUT) -> str:
-    req = urllib.request.Request(url, headers={
+def fetch_url(url: str, timeout=FETCH_TIMEOUT, retries=FETCH_RETRIES) -> str:
+    """Fetch URL with retry. Falls back to a relaxed SSL context if cert verify fails (#5)."""
+    import ssl
+    headers = {
         'User-Agent': USER_AGENT,
         'Accept': 'application/rss+xml, application/xml, text/xml, application/json, */*',
         'Accept-Language': 'en-US,en;q=0.9',
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        return raw.decode('utf-8', errors='replace')
+    }
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode('utf-8', errors='replace')
+        except urllib.error.URLError as e:
+            last_err = e
+            reason = str(getattr(e, 'reason', e))
+            # Cert hostname mismatch / verify failure -> retry once with relaxed SSL
+            if 'CERTIFICATE_VERIFY_FAILED' in reason or 'certificate' in reason.lower():
+                try:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        return resp.read().decode('utf-8', errors='replace')
+                except Exception as e2:
+                    last_err = e2
+            time.sleep(1)  # brief pause before next attempt
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+    raise last_err if last_err else RuntimeError(f"fetch failed: {url}")
 
 
 def load_top_assets() -> list:
@@ -384,43 +412,69 @@ def _mk_item(source, title, link, desc, pub):
 
 
 def parse_date(s: str) -> float:
+    now = time.time()
     if not s:
-        return time.time()
+        return now
+    ts = None
     try:
         dt = parsedate_to_datetime(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
+        ts = dt.timestamp()
     except Exception:
-        pass
-    for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S'):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
-        except Exception:
-            continue
-    return time.time()
+        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%dT%H:%M:%S.%f%z', '%a, %d %b %Y %H:%M:%S %Z'):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts = dt.timestamp()
+                break
+            except Exception:
+                continue
+    if ts is None:
+        return now
+    # Clamp obviously-wrong future dates to now (#16): some feeds publish bad TZ/dates
+    if ts > now + 3600:
+        return now
+    # Clamp absurdly old (>10y) to now as well
+    if ts < now - 10 * 365 * 86400:
+        return now
+    return ts
 
 
 # ============================================================
 # THEME DEDUP + CONFIRMATION COUNTER
 # ============================================================
 
-STOPWORDS = set('the a an of to in on for and or as at by is are be with from this that into over after amid'.split())
+STOPWORDS = set('the a an of to in on for and or as at by is are be with from this that into over after amid '
+                'new now says will can could may might has have had been being its their his her'.split())
+
+# Normalize money/number mentions so "$500M" and "half a billion" land closer
+def _normalize_tokens(title: str) -> list:
+    t = title.lower()
+    # collapse money amounts to a generic token
+    t = re.sub(r'\$\s?[\d,.]+\s?(b|bn|billion|m|mn|million|k|thousand)?', ' MONEY ', t)
+    t = re.sub(r'\b\d+(\.\d+)?\s?%', ' PCT ', t)
+    t = re.sub(r'\b\d[\d,.]*\b', ' NUM ', t)
+    words = re.findall(r'[a-z0-9]+', t)
+    return [w for w in words if w not in STOPWORDS and len(w) > 2]
 
 
 def theme_key(title: str) -> str:
-    """Build a fuzzy theme key from the most significant words of a headline."""
-    words = re.findall(r'[a-z0-9]+', title.lower())
-    sig = [w for w in words if w not in STOPWORDS and len(w) > 2]
-    sig = sorted(sig)[:5]
+    """Fuzzy theme key from most significant normalized words of a headline."""
+    sig = _normalize_tokens(title)
+    sig = sorted(set(sig))[:6]
     return hashlib.md5(' '.join(sig).encode()).hexdigest()[:12]
 
 
+def _token_set(title: str) -> set:
+    return set(_normalize_tokens(title))
+
+
 def dedup_and_confirm(items: list) -> list:
-    """Exact-dedup by title hash; group by theme; mark follow-ups; count confirmations."""
+    """Exact-dedup by title hash; group by theme (with token-overlap merging);
+    mark follow-ups; count confirmations (#4)."""
     seen_exact = {}
     for it in items:
         h = hashlib.md5(it['title'].lower().strip().encode()).hexdigest()
@@ -428,19 +482,49 @@ def dedup_and_confirm(items: list) -> list:
             seen_exact[h] = it
     unique = list(seen_exact.values())
 
-    # Group by theme
+    # First pass: group by theme key
     themes = {}
     for it in unique:
         tk = theme_key(it['title'])
         themes.setdefault(tk, []).append(it)
 
+    # Second pass: merge theme groups that share high token overlap (#4)
+    # so differently-worded headlines about the same event still group.
+    theme_list = list(themes.items())
+    theme_tokens = {}
+    for tk, group in theme_list:
+        # representative token set = union of group titles
+        toks = set()
+        for it in group:
+            toks |= _token_set(it['title'])
+        theme_tokens[tk] = toks
+
+    merged_into = {}  # tk -> target tk
+    keys = [tk for tk, _ in theme_list]
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            a, b = keys[i], keys[j]
+            if a in merged_into or b in merged_into:
+                continue
+            ta, tb = theme_tokens[a], theme_tokens[b]
+            if not ta or not tb:
+                continue
+            overlap = len(ta & tb) / min(len(ta), len(tb))
+            if overlap >= 0.6:  # 60%+ shared significant tokens => same story
+                merged_into[b] = a
+
+    final_groups = {}
+    for tk, group in theme_list:
+        target = merged_into.get(tk, tk)
+        final_groups.setdefault(target, []).extend(group)
+
     result = []
-    for tk, group in themes.items():
-        group.sort(key=lambda x: x['published_on'])  # oldest first
+    for tk, group in final_groups.items():
+        group.sort(key=lambda x: x['published_on'])
         confirmations = len(group)
         for idx, it in enumerate(group):
             it['confirmations'] = confirmations
-            it['is_follow_up'] = (idx > 0)  # earliest is original, rest are follow-ups
+            it['is_follow_up'] = (idx > 0)
             result.append(it)
     return result
 
@@ -473,16 +557,28 @@ def save_score_cache(cache: dict) -> None:
 
 
 CLAUDE_SYSTEM = (
-    "Ты крипто-аналитик, оцениваешь влияние новостей на цену активов для трейдеров. "
-    "Отвечай ТОЛЬКО валидным JSON без markdown, без пояснений вокруг."
+    "Ты опытный крипто-аналитик. Оцениваешь влияние новостей на цену активов для трейдеров. "
+    "Различай реальные события и мнения/прогнозы аналитиков. "
+    "Различай новости, которые ПРО конкретный актив, и где актив лишь упомянут в списке. "
+    "Отвечай ТОЛЬКО валидным JSON без markdown и без пояснений вокруг."
 )
+
+# Few-shot examples to calibrate scoring (#1)
+CLAUDE_FEWSHOT = """Примеры правильной оценки:
+
+Новость: "SEC approves first spot Bitcoin ETF" → {"impact": 9, "sentiment": 1, "horizon": "long", "type": "fact", "reason": "Историческое регуляторное одобрение, мощный приток институционалов"}
+Новость: "Analyst predicts XRP could hit $10 by 2027" → {"impact": 2, "sentiment": 0, "horizon": "long", "type": "opinion", "reason": "Спекулятивный прогноз без фактической основы"}
+Новость: "Crypto market sheds $1B as BTC, ETH, SOL all drop" → для BTC: {"impact": 5, "sentiment": -1, "relevance": "mentioned", "reason": "Общерыночное падение, BTC не главный герой"}
+"""
 
 
 def build_claude_prompt(item: dict) -> str:
     assets = ', '.join(item.get('assets', []))
     title = item['title'][:300]
     body = item.get('body', '')[:600]
-    return f"""Оцени крипто-новость для трейдера.
+    return f"""{CLAUDE_FEWSHOT}
+
+Теперь оцени эту новость:
 
 Заголовок: {title}
 Текст: {body}
@@ -490,25 +586,38 @@ def build_claude_prompt(item: dict) -> str:
 
 Верни JSON строго такого формата:
 {{
-  "impact": <число 0-10, насколько сильно повлияет на цену>,
+  "impact": <0-10, сила влияния на цену главного актива>,
   "sentiment": <-1 негатив, 0 нейтрально, 1 позитив>,
   "primary_asset": "<главный тикер из списка выше>",
-  "category": "<одно из: institutional, regulatory, technical, hack, listing, partnership, macro, market, other>",
-  "is_dust": <true если это пустышка/реклама/гайд/кликбейт без реальной значимости, иначе false>,
+  "relevance": "<main если новость в основном про этот актив, mentioned если упомянут среди прочих>",
+  "horizon": "<short краткосрок (часы-дни), long долгосрок (недели+)>",
+  "type": "<fact реальное событие, opinion мнение/прогноз>",
+  "category": "<institutional, regulatory, technical, hack, listing, partnership, macro, market, other>",
+  "is_dust": <true если реклама/гайд/кликбейт/пустой прогноз без значимости>,
   "reason": "<одна короткая фраза по-русски, почему такая оценка>"
 }}
 
 Правила:
-- Учитывай контекст и отрицания: "SEC drops lawsuit" = позитив, не негатив.
-- Реклама, обучающие гайды ("how to buy"), общие обзоры рынка без конкретики, ценовые прогнозы-кликбейты = is_dust: true, impact 0-2.
-- Реальные события (листинги, взломы, партнёрства, регуляторика, институционалы, крупные движения) = impact 5-10."""
+- Учитывай отрицания: "SEC drops lawsuit" = позитив, не негатив.
+- Мнения и прогнозы ("analyst says", "could reach", "might") = type opinion, impact обычно 1-3.
+- Если актив лишь в списке пострадавших (общерыночная новость) = relevance mentioned, impact ниже.
+- Реклама, гайды "how to buy", общие обзоры без конкретики = is_dust true, impact 0-2.
+- Реальные события (листинги, взломы, партнёрства, регуляторика, институционалы) = type fact, impact 5-10."""
 
 
 def call_claude(api_key: str, item: dict) -> dict | None:
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": CLAUDE_MAX_TOKENS,
-        "system": CLAUDE_SYSTEM,
+        # System as a cacheable block (#10): the static instructions get a 90% discount
+        # on repeated calls within the cache window.
+        "system": [
+            {
+                "type": "text",
+                "text": CLAUDE_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         "messages": [{"role": "user", "content": build_claude_prompt(item)}],
     }
     req = urllib.request.Request(
@@ -518,19 +627,18 @@ def call_claude(api_key: str, item: dict) -> dict | None:
             "content-type": "application/json",
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta": "prompt-caching-2024-07-31",
         },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-        # Extract text from content blocks
         text = ''
         for block in data.get('content', []):
             if block.get('type') == 'text':
                 text += block.get('text', '')
         text = text.strip()
-        # Strip markdown fences if any slipped in
         text = re.sub(r'^```(?:json)?|```$', '', text, flags=re.M).strip()
         parsed = json.loads(text)
         return parsed
@@ -557,9 +665,16 @@ def claude_rescore(items: list, assets: list) -> None:
     calls_made = 0
     cache_hits = 0
 
-    # Prioritize items most worth spending a call on: highest heuristic impact first,
-    # so if we hit CLAUDE_MAX_PER_RUN we've scored the most promising ones.
-    items_sorted = sorted(items, key=lambda x: x.get('impact', 0), reverse=True)
+    # Smarter prioritization (#11): rank candidates by a blend of heuristic impact
+    # and source quality, so low-quality SEO sources don't eat Claude budget first.
+    def priority(it):
+        base = it.get('impact', 0)
+        if it.get('source') in LOW_QUALITY_SOURCES:
+            base -= 2  # deprioritize SEO-heavy feeds
+        if it.get('is_follow_up'):
+            base -= 1  # originals before follow-ups
+        return base
+    items_sorted = sorted(items, key=priority, reverse=True)
 
     for it in items_sorted:
         h = _news_hash(it['title'])
@@ -570,37 +685,48 @@ def claude_rescore(items: list, assets: list) -> None:
             it['reason'] = c.get('reason', '')
             it['category'] = c.get('category', '')
             it['is_dust'] = c.get('is_dust', False)
+            it['horizon'] = c.get('horizon', '')
+            it['news_type'] = c.get('news_type', '')
+            it['relevance'] = c.get('relevance', 'main')
             it['scored_by'] = 'claude-cached'
             cache_hits += 1
             continue
 
         if calls_made >= CLAUDE_MAX_PER_RUN:
-            # Leave remaining items on heuristic score
             it['scored_by'] = 'heuristic'
             continue
 
         result = call_claude(api_key, it)
         calls_made += 1
         if result is None:
-            it['scored_by'] = 'heuristic'  # fallback, keep heuristic values
+            it['scored_by'] = 'heuristic'
             continue
 
-        # Apply Claude's scores
         try:
-            it['impact'] = max(0, min(10, float(result.get('impact', it['impact']))))
+            impact = max(0, min(10, float(result.get('impact', it['impact']))))
+            relevance = str(result.get('relevance', 'main')).lower()
+            # Relevance penalty (#3): if asset is only "mentioned", reduce its impact
+            if relevance == 'mentioned':
+                impact = round(impact * 0.6, 1)
+
+            it['impact'] = impact
             it['sentiment'] = int(result.get('sentiment', it['sentiment']))
             it['reason'] = str(result.get('reason', ''))[:200]
             it['category'] = str(result.get('category', ''))[:30]
             it['is_dust'] = bool(result.get('is_dust', False))
+            it['horizon'] = str(result.get('horizon', ''))[:10]
+            it['news_type'] = str(result.get('type', ''))[:10]
+            it['relevance'] = relevance
             pa = result.get('primary_asset', '')
             if pa and pa in it.get('assets', []):
                 it['primary_asset'] = pa
             it['scored_by'] = 'claude'
-            # Cache it
             cache[h] = {
                 'impact': it['impact'], 'sentiment': it['sentiment'],
                 'reason': it['reason'], 'category': it['category'],
-                'is_dust': it['is_dust'], 'cached_at': time.time(),
+                'is_dust': it['is_dust'], 'horizon': it['horizon'],
+                'news_type': it['news_type'], 'relevance': it['relevance'],
+                'cached_at': time.time(),
             }
         except Exception as e:
             print(f"[claude] parse error: {e}")
@@ -663,6 +789,9 @@ def main():
         it['reason'] = ''  # filled by Claude
         it['category'] = (s.get('categories') or [''])[0]
         it['is_dust'] = False
+        it['horizon'] = ''
+        it['news_type'] = ''
+        it['relevance'] = 'main'
         it['scored_by'] = 'heuristic'
         scored.append(it)
 
