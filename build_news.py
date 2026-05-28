@@ -106,6 +106,48 @@ AMBIGUOUS_SYMBOLS = {
 }
 
 
+# ============================================================
+# TRANSLATION (free Google Translate endpoint, no key)
+# ============================================================
+
+_translate_cache = {}  # title -> ru translation (in-memory per run)
+
+
+def translate_to_ru(text: str) -> str:
+    """Translate text to Russian via the free Google Translate endpoint.
+    Returns original text on failure. Caches within a run."""
+    if not text:
+        return text
+    if text in _translate_cache:
+        return _translate_cache[text]
+    try:
+        params = urllib.parse.urlencode({
+            'client': 'gtx',
+            'sl': 'auto',
+            'tl': 'ru',
+            'dt': 't',
+            'q': text,
+        })
+        url = f'https://translate.googleapis.com/translate_a/single?{params}'
+        raw = fetch_url(url, timeout=10, retries=1)
+        data = json.loads(raw)
+        # Response: [[[translated, original, ...], ...], ...]
+        translated = ''.join(seg[0] for seg in data[0] if seg and seg[0])
+        translated = translated.strip() or text
+        _translate_cache[text] = translated
+        return translated
+    except Exception as e:
+        _translate_cache[text] = text  # cache failure as passthrough
+        return text
+
+
+def load_translate_cache_from(score_cache: dict) -> None:
+    """Seed in-memory translation cache from persisted titles (avoids re-translating)."""
+    for v in score_cache.values():
+        if 'title_orig' in v and 'title_ru' in v:
+            _translate_cache[v['title_orig']] = v['title_ru']
+
+
 def fetch_url(url: str, timeout=FETCH_TIMEOUT, retries=FETCH_RETRIES) -> str:
     """Fetch URL with retry. Falls back to a relaxed SSL context if cert verify fails (#5)."""
     import ssl
@@ -323,6 +365,62 @@ def score_news(title: str, body: str, source: str, published_unix: float) -> dic
         'specificity': specificity_label,
         'source_quality': source_quality,
     }
+
+
+# Category -> human phrase for heuristic micro-summary (Russian)
+_CAT_PHRASES = {
+    'regulation': 'регуляторное событие',
+    'regulatory_pos': 'позитивный регуляторный сигнал',
+    'etf': 'новость про ETF',
+    'security': 'инцидент безопасности (взлом/эксплойт)',
+    'delisting': 'делистинг',
+    'listing': 'листинг на бирже',
+    'institutional': 'движение институционалов',
+    'partnership': 'партнёрство',
+    'tech': 'техническое обновление',
+    'price': 'ценовое движение вверх',
+    'price_neg': 'резкое падение цены',
+    'whale': 'активность китов',
+    'tokenomics': 'изменение токеномики',
+    'macro': 'макроэкономический фактор',
+    'negated': 'отмена/закрытие негативного события',
+}
+
+
+def heuristic_reason(item: dict, scored: dict) -> str:
+    """Generate a simple Russian micro-summary for items not scored by Claude."""
+    cats = scored.get('categories', [])
+    sent = scored.get('sentiment', 0)
+    impact = scored.get('impact', 0)
+    conf = item.get('confirmations', 1)
+
+    # Pick the most meaningful category phrase
+    phrase = None
+    for c in cats:
+        if c in _CAT_PHRASES:
+            phrase = _CAT_PHRASES[c]
+            break
+
+    sent_word = 'позитивная' if sent > 0 else 'негативная' if sent < 0 else 'нейтральная'
+
+    parts = []
+    if phrase:
+        parts.append(phrase.capitalize())
+    else:
+        parts.append(f'{sent_word.capitalize()} новость')
+
+    # Impact descriptor
+    if impact >= 7:
+        parts.append('высокая значимость')
+    elif impact >= 5:
+        parts.append('средняя значимость')
+    else:
+        parts.append('низкая значимость')
+
+    if conf >= 3:
+        parts.append(f'подтверждено {conf} источниками')
+
+    return ', '.join(parts) + '.'
 
 
 def map_news_to_assets(title: str, body: str, assets: list) -> list:
@@ -784,6 +882,7 @@ def main():
             s['impact'] = round(s['impact'] * 0.5, 1)
 
         it.update(s)
+        it['_score'] = s  # keep for heuristic reason generation
         it['assets'] = matched
         it['primary_asset'] = matched[0]
         it['reason'] = ''  # filled by Claude
@@ -810,6 +909,24 @@ def main():
     # Sort newest first, cap
     scored.sort(key=lambda x: x['published_on'], reverse=True)
     scored = scored[:MAX_NEWS_OUTPUT]
+
+    # Fill heuristic micro-summaries for items Claude didn't score
+    for it in scored:
+        if not it.get('reason'):
+            it['reason'] = heuristic_reason(it, it.get('_score', {}))
+
+    # Translate headlines to Russian (free Google endpoint)
+    translated = 0
+    for it in scored:
+        ru = translate_to_ru(it['title'])
+        it['title_ru'] = ru
+        if ru != it['title']:
+            translated += 1
+    print(f"[translate] translated {translated}/{len(scored)} headlines to RU")
+
+    # Clean internal field before output
+    for it in scored:
+        it.pop('_score', None)
 
     output = {
         'generated_at': int(time.time()),
