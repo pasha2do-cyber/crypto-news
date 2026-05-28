@@ -39,7 +39,7 @@ jobs:
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
-          git add public/news.json .assets_cache.json 2>/dev/null || true
+          git add public/news.json .assets_cache.json .score_cache.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else

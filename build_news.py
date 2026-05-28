@@ -35,10 +35,18 @@ from pathlib import Path
 OUT_DIR = Path(__file__).parent / 'public'
 NEWS_OUT = OUT_DIR / 'news.json'
 ASSETS_CACHE = Path(__file__).parent / '.assets_cache.json'
+SCORE_CACHE = Path(__file__).parent / '.score_cache.json'  # persistent LLM scores
 FETCH_TIMEOUT = 20
 MAX_NEWS_OUTPUT = 300          # cap items in news.json
 ASSETS_REFRESH_SEC = 86400     # refresh top-100 once a day
 NEWS_MAX_AGE_HOURS = 72        # drop news older than this
+
+# --- Claude / scoring config ---
+CLAUDE_MODEL = 'claude-haiku-4-5-20251001'
+CLAUDE_MAX_TOKENS = 500        # ceiling for the JSON response
+CLAUDE_MAX_PER_RUN = 25        # safety cap: don't score more than N new items per run
+IMPACT_THRESHOLD = 3.0         # items below this are "dust" -> excluded from news.json
+SCORE_CACHE_MAX_AGE = 72 * 3600  # forget cached scores older than this
 
 USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
               'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
@@ -56,9 +64,22 @@ RSS_FEEDS = [
     ('U.Today',        'https://u.today/rss'),
     ('AMBCrypto',      'https://ambcrypto.com/feed/'),
     ('CoinGape',       'https://coingape.com/feed/'),
+    # Additional sources (more coverage)
+    ('The Defiant',    'https://thedefiant.io/api/feed'),
+    ('CryptoNews',     'https://cryptonews.com/news/feed/'),
+    ('Crypto.news',    'https://crypto.news/feed/'),
+    ('Bitcoinist',     'https://bitcoinist.com/feed/'),
+    ('99Bitcoins',     'https://99bitcoins.com/feed/'),
+    ('CoinJournal',    'https://coinjournal.net/feed/'),
+    ('DLNews',         'https://www.dlnews.com/arc/outboundfeeds/rss/'),
+    ('Blockworks',     'https://blockworks.co/feed'),
+    ('CoinCodex',      'https://coincodex.com/en/resources/feed/news/'),
+    ('FinanceMagnates','https://www.financemagnates.com/cryptocurrency/feed/'),
+    # Google News by topic — generated, very stable
     ('Google: Crypto', 'https://news.google.com/rss/search?q=cryptocurrency+OR+bitcoin+OR+ethereum&hl=en-US&gl=US&ceid=US:en'),
     ('Google: DeFi',   'https://news.google.com/rss/search?q=defi+OR+%22smart+contract%22+crypto&hl=en-US&gl=US&ceid=US:en'),
     ('Google: Reg',    'https://news.google.com/rss/search?q=SEC+OR+regulation+crypto&hl=en-US&gl=US&ceid=US:en'),
+    ('Google: ETF',    'https://news.google.com/rss/search?q=crypto+ETF+OR+bitcoin+ETF&hl=en-US&gl=US&ceid=US:en'),
 ]
 
 # ============================================================
@@ -425,19 +446,169 @@ def dedup_and_confirm(items: list) -> list:
 
 
 # ============================================================
-# OPTIONAL: CLAUDE HAIKU RE-SCORING (Step 3 — off unless key present)
+# CLAUDE HAIKU RE-SCORING (Step 3)
 # ============================================================
 
+def _news_hash(title: str) -> str:
+    return hashlib.md5(title.lower().strip().encode()).hexdigest()
+
+
+def load_score_cache() -> dict:
+    if SCORE_CACHE.exists():
+        try:
+            data = json.loads(SCORE_CACHE.read_text())
+            # prune old entries
+            cutoff = time.time() - SCORE_CACHE_MAX_AGE
+            return {k: v for k, v in data.items() if v.get('cached_at', 0) >= cutoff}
+        except Exception:
+            return {}
+    return {}
+
+
+def save_score_cache(cache: dict) -> None:
+    try:
+        SCORE_CACHE.write_text(json.dumps(cache, ensure_ascii=False))
+    except Exception as e:
+        print(f"[claude] cache save failed: {e}")
+
+
+CLAUDE_SYSTEM = (
+    "Ты крипто-аналитик, оцениваешь влияние новостей на цену активов для трейдеров. "
+    "Отвечай ТОЛЬКО валидным JSON без markdown, без пояснений вокруг."
+)
+
+
+def build_claude_prompt(item: dict) -> str:
+    assets = ', '.join(item.get('assets', []))
+    title = item['title'][:300]
+    body = item.get('body', '')[:600]
+    return f"""Оцени крипто-новость для трейдера.
+
+Заголовок: {title}
+Текст: {body}
+Упомянутые активы: {assets}
+
+Верни JSON строго такого формата:
+{{
+  "impact": <число 0-10, насколько сильно повлияет на цену>,
+  "sentiment": <-1 негатив, 0 нейтрально, 1 позитив>,
+  "primary_asset": "<главный тикер из списка выше>",
+  "category": "<одно из: institutional, regulatory, technical, hack, listing, partnership, macro, market, other>",
+  "is_dust": <true если это пустышка/реклама/гайд/кликбейт без реальной значимости, иначе false>,
+  "reason": "<одна короткая фраза по-русски, почему такая оценка>"
+}}
+
+Правила:
+- Учитывай контекст и отрицания: "SEC drops lawsuit" = позитив, не негатив.
+- Реклама, обучающие гайды ("how to buy"), общие обзоры рынка без конкретики, ценовые прогнозы-кликбейты = is_dust: true, impact 0-2.
+- Реальные события (листинги, взломы, партнёрства, регуляторика, институционалы, крупные движения) = impact 5-10."""
+
+
+def call_claude(api_key: str, item: dict) -> dict | None:
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "system": CLAUDE_SYSTEM,
+        "messages": [{"role": "user", "content": build_claude_prompt(item)}],
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "content-type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        # Extract text from content blocks
+        text = ''
+        for block in data.get('content', []):
+            if block.get('type') == 'text':
+                text += block.get('text', '')
+        text = text.strip()
+        # Strip markdown fences if any slipped in
+        text = re.sub(r'^```(?:json)?|```$', '', text, flags=re.M).strip()
+        parsed = json.loads(text)
+        return parsed
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors='replace')[:200]
+        print(f"[claude] HTTP {e.code}: {body}")
+        return None
+    except Exception as e:
+        print(f"[claude] call failed: {e}")
+        return None
+
+
 def claude_rescore(items: list, assets: list) -> None:
-    """If ANTHROPIC_API_KEY is set, re-score top items with Claude Haiku.
-    Mutates items in place, adding 'reason' and refining impact/sentiment.
-    Currently a stub that activates only when the key exists."""
+    """Re-score NEW items with Claude Haiku. Cached items reuse stored scores.
+    Mutates items in place: sets impact, sentiment, reason, category, is_dust."""
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
-        print("[claude] no API key — skipping LLM rescoring (heuristic only)")
+        print("[claude] no API key — heuristic only")
+        for it in items:
+            it['scored_by'] = 'heuristic'
         return
-    # Placeholder for Step 3. Will batch top-N items to Claude Haiku.
-    print("[claude] API key present — LLM rescoring will be implemented in Step 3")
+
+    cache = load_score_cache()
+    calls_made = 0
+    cache_hits = 0
+
+    # Prioritize items most worth spending a call on: highest heuristic impact first,
+    # so if we hit CLAUDE_MAX_PER_RUN we've scored the most promising ones.
+    items_sorted = sorted(items, key=lambda x: x.get('impact', 0), reverse=True)
+
+    for it in items_sorted:
+        h = _news_hash(it['title'])
+        if h in cache:
+            c = cache[h]
+            it['impact'] = c['impact']
+            it['sentiment'] = c['sentiment']
+            it['reason'] = c.get('reason', '')
+            it['category'] = c.get('category', '')
+            it['is_dust'] = c.get('is_dust', False)
+            it['scored_by'] = 'claude-cached'
+            cache_hits += 1
+            continue
+
+        if calls_made >= CLAUDE_MAX_PER_RUN:
+            # Leave remaining items on heuristic score
+            it['scored_by'] = 'heuristic'
+            continue
+
+        result = call_claude(api_key, it)
+        calls_made += 1
+        if result is None:
+            it['scored_by'] = 'heuristic'  # fallback, keep heuristic values
+            continue
+
+        # Apply Claude's scores
+        try:
+            it['impact'] = max(0, min(10, float(result.get('impact', it['impact']))))
+            it['sentiment'] = int(result.get('sentiment', it['sentiment']))
+            it['reason'] = str(result.get('reason', ''))[:200]
+            it['category'] = str(result.get('category', ''))[:30]
+            it['is_dust'] = bool(result.get('is_dust', False))
+            pa = result.get('primary_asset', '')
+            if pa and pa in it.get('assets', []):
+                it['primary_asset'] = pa
+            it['scored_by'] = 'claude'
+            # Cache it
+            cache[h] = {
+                'impact': it['impact'], 'sentiment': it['sentiment'],
+                'reason': it['reason'], 'category': it['category'],
+                'is_dust': it['is_dust'], 'cached_at': time.time(),
+            }
+        except Exception as e:
+            print(f"[claude] parse error: {e}")
+            it['scored_by'] = 'heuristic'
+
+    save_score_cache(cache)
+    print(f"[claude] {calls_made} new calls, {cache_hits} cache hits, "
+          f"model={CLAUDE_MODEL}")
 
 
 # ============================================================
@@ -489,11 +660,23 @@ def main():
         it.update(s)
         it['assets'] = matched
         it['primary_asset'] = matched[0]
-        it['reason'] = ''  # filled by Claude in Step 3
+        it['reason'] = ''  # filled by Claude
+        it['category'] = (s.get('categories') or [''])[0]
+        it['is_dust'] = False
+        it['scored_by'] = 'heuristic'
         scored.append(it)
 
     # Optional LLM rescoring
     claude_rescore(scored, assets)
+
+    # Filter out "dust": low impact or flagged by Claude as dust
+    before = len(scored)
+    scored = [
+        it for it in scored
+        if not it.get('is_dust', False) and it.get('impact', 0) >= IMPACT_THRESHOLD
+    ]
+    print(f"[filter] removed {before - len(scored)} dust items "
+          f"(threshold={IMPACT_THRESHOLD}), {len(scored)} remain")
 
     # Sort newest first, cap
     scored.sort(key=lambda x: x['published_on'], reverse=True)
