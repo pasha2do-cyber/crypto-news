@@ -1,0 +1,48 @@
+name: Build News
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub's minimum interval).
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}   # allow manual trigger from the Actions tab
+  push:
+    branches: [ main ]
+    paths:
+      - 'build_news.py'
+      - '.github/workflows/build-news.yml'
+
+permissions:
+  contents: write   # needed to commit news.json back to the repo
+
+concurrency:
+  group: build-news
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build news.json
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python3 build_news.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add public/news.json .assets_cache.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update news.json [skip ci]"
+            git push
+          fi
